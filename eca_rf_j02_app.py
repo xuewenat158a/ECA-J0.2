@@ -1,4 +1,5 @@
 # eca_rf_j02_app.py
+# eca_rf_j02_app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -12,9 +13,21 @@ from sklearn.preprocessing import OneHotEncoder
 from sklearn.model_selection import train_test_split, KFold, cross_validate
 from sklearn.pipeline import Pipeline
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import r2_score, mean_squared_error, make_scorer
+from sklearn.metrics import r2_score, mean_squared_error
 from sklearn.inspection import permutation_importance
 import joblib
+
+# ---------- 兼容 RMSE ----------
+import inspect as _insp
+import numpy as _np
+from sklearn.metrics import mean_squared_error as _mse
+
+def _rmse(y_true, y_pred):
+    """兼容新旧 sklearn 版本的 RMSE 计算"""
+    if "squared" in _insp.signature(_mse).parameters:
+        return _mse(y_true, y_pred, squared=False)
+    else:
+        return _np.sqrt(_mse(y_true, y_pred))
 
 # ---------------- Page ----------------
 st.set_page_config(page_title="ECA RF — J0.2 (5 inputs)", layout="wide")
@@ -208,7 +221,7 @@ st.success("Model trained.")
 # ---------------- Evaluation ----------------
 y_pred = pipe.predict(X_test)
 r2 = r2_score(y_test, y_pred)
-rmse = mean_squared_error(y_test, y_pred, squared=False)
+rmse = _rmse(y_test, y_pred)   # ✅ 使用兼容函数
 
 col1, col2, col3 = st.columns(3)
 with col1:
@@ -218,15 +231,6 @@ with col2:
 with col3:
     oob = getattr(pipe.named_steps["model"], "oob_score_", None)
     st.metric("OOB R²", f"{oob:.3f}" if oob is not None else "N/A")
-
-# Optional CV
-if run_cv:
-    with st.spinner("Running 5-fold CV..."):
-        kf = KFold(n_splits=5, shuffle=True, random_state=random_state)
-        scores = cross_validate(pipe, X, y, cv=kf, scoring="r2", n_jobs=-1)
-    st.write(
-        f"CV R² (mean ± std): **{scores['test_score'].mean():.3f} ± {scores['test_score'].std():.3f}**"
-    )
 
 # ---------------- Permutation Importance (aggregated) ----------------
 with st.spinner("Computing permutation importance..."):
