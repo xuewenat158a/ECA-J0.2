@@ -1,5 +1,4 @@
-# eca_rf_j02_app.py
-# eca_rf_j02_app.py
+# eca_rf_j02_app.py  — J0.2 (5 inputs) with stratified split, optional winsorize, stabilized RF, distro check
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -17,28 +16,27 @@ from sklearn.metrics import r2_score, mean_squared_error
 from sklearn.inspection import permutation_importance
 import joblib
 
-# ---------- 兼容 RMSE ----------
+# ---------- RMSE 兼容（旧版 sklearn 无 squared 参数） ----------
 import inspect as _insp
 import numpy as _np
 from sklearn.metrics import mean_squared_error as _mse
-
 def _rmse(y_true, y_pred):
-    """兼容新旧 sklearn 版本的 RMSE 计算"""
     if "squared" in _insp.signature(_mse).parameters:
         return _mse(y_true, y_pred, squared=False)
     else:
         return _np.sqrt(_mse(y_true, y_pred))
+# ------------------------------------------------------------
 
-# ---------------- Page ----------------
 st.set_page_config(page_title="ECA RF — J0.2 (5 inputs)", layout="wide")
 st.title("ECA Random Forest — Predict J0.2 (5 Inputs)")
 
 with st.expander("About this app", expanded=False):
     st.markdown(
-        "- Trains a Random Forest to predict **J0.2** from 5 inputs.\\n"
-        "- Handles categorical inputs via version-proof OneHotEncoder.\\n"
-        "- Shows test metrics, **OOB R²**, aggregated permutation importance, diagnostics with legend, and a Model Card.\\n"
-        "- Try single prediction or upload a batch of feature rows."
+        "- Predict **J0.2** from 5 inputs (Sour Region, pH, ppH2S, K-rate, Notch Location).\n"
+        "- OneHotEncoder version-proof; OOB R²; aggregated permutation importance; diagnostics with legend.\n"
+        "- **New:** stratified train/test by J0.2 (分层切分), optional winsorize outliers, stabilized RF hyperparams,\n"
+        "  target distribution check (train vs test), fixed axes for Actual vs Predicted.\n"
+        "- Single prediction & batch prediction with robust filling; Model Card export."
     )
 
 # ---------------- Sidebar ----------------
@@ -61,17 +59,22 @@ n_estimators = st.sidebar.slider("n_estimators", 200, 1000, 500, 50)
 random_state = st.sidebar.number_input("random_state", min_value=0, value=42, step=1)
 run_cv = st.sidebar.checkbox("Run 5-fold CV (average R²)", value=False)
 
+# 可选：对目标做轻量截尾（缓解极端值影响）
+cap_outliers = st.sidebar.checkbox("Cap J0.2 outliers (1st–99th percentile)", value=False)
+
+with st.sidebar.expander("Advanced RF (stabilize)"):
+    min_samples_leaf = st.slider("min_samples_leaf", 1, 10, 3, 1)
+    max_depth_opt = st.slider("max_depth (0=None)", 0, 30, 0, 1)
+    max_depth = None if max_depth_opt == 0 else max_depth_opt
+    max_features = st.selectbox("max_features", ["sqrt", "log2", "auto/None"], index=0)
+    max_features = None if max_features == "auto/None" else max_features
+
 st.sidebar.markdown("---")
 do_save = st.sidebar.checkbox("Save trained model", value=True)
 model_filename = st.sidebar.text_input("Model filename", value="eca_rf_j02.joblib")
 
-# ---------------- Columns (your locked schema) ----------------
-# Preview order from raw sheet (exact names)
-PREVIEW_ORDER = [
-    "Sour region", "pH", "ppH2S(bara)", "K-rate", "Notch Location", "J0.2"
-]
-
-# Training canonical names after renaming
+# ---------------- Columns (locked schema) ----------------
+PREVIEW_ORDER = ["Sour region", "pH", "ppH2S(bara)", "K-rate", "Notch Location", "J0.2"]
 RAW_FEATURES = ["Sour region", "pH", "ppH2S(bara)", "K-rate", "Notch Location"]
 CANON_FEATURES = ["Sour Region", "pH", "ppH2S", "K-rate", "Notch Location"]
 CATEGORICAL_FEATS = ["Sour Region", "Notch Location"]
@@ -79,7 +82,6 @@ TARGET_COL = "J0.2"
 
 # ---------------- Helpers ----------------
 def make_ohe():
-    # Version-proof OneHotEncoder
     if "sparse_output" in inspect.signature(OneHotEncoder).parameters:
         return OneHotEncoder(handle_unknown="ignore", sparse_output=False)
     else:
@@ -91,38 +93,30 @@ def load_excel_raw(_uploaded_file, _input_path, _sheet):
         df_raw = pd.read_excel(_uploaded_file, sheet_name=_sheet)
     else:
         df_raw = pd.read_excel(_input_path, sheet_name=_sheet)
-    # strip hidden chars/whitespace but DO NOT change header semantics
-    df_raw.columns = [c.strip().replace("\\u200b", "") for c in df_raw.columns]
+    df_raw.columns = [c.strip().replace("\u200b", "") for c in df_raw.columns]
     return df_raw
 
 def apply_training_renames(df_raw: pd.DataFrame) -> pd.DataFrame:
     df = df_raw.copy()
-    df.rename(
-        columns={
-            "Sour region": "Sour Region",
-            "ppH2S(bara)": "ppH2S",
-            "a/w": "a/W",
-            "Test Pressure(bara)": "Test Pressure",
-        },
-        inplace=True,
-    )
+    df.rename(columns={
+        "Sour region": "Sour Region",
+        "ppH2S(bara)": "ppH2S",
+        "a/w": "a/W",
+        "Test Pressure(bara)": "Test Pressure",
+    }, inplace=True)
     return df
 
 def get_all_feature_names(preprocessor, X_sample, num_cols, cat_cols):
-    # If not fitted (shouldn't happen in this flow), approximate width
     if not hasattr(preprocessor, "transformers_"):
         dim = len(num_cols)
         for c in cat_cols:
             dim += len(pd.Series(X_sample[c]).dropna().unique())
         names = [f"feat__{i}" for i in range(dim)]
         return names, names
-
     try:
         full = preprocessor.get_feature_names_out()
     except Exception:
-        full = []
-        for c in num_cols:
-            full.append(f"num__{c}")
+        full = [f"num__{c}" for c in num_cols]
         if "cat" in preprocessor.named_transformers_:
             ohe = preprocessor.named_transformers_["cat"]
             try:
@@ -133,37 +127,46 @@ def get_all_feature_names(preprocessor, X_sample, num_cols, cat_cols):
                     n_cat = len(pd.Series(X_sample[col]).dropna().unique())
                     ohe_names.extend([f"{col}_{i}" for i in range(n_cat)])
             full.extend([f"cat__{n}" for n in ohe_names])
-
     clean = [n.split("__", 1)[1] if "__" in n else n for n in full]
-
     try:
         width = preprocessor.transform(X_sample.iloc[:1]).shape[1]
     except Exception:
         width = len(full)
-
     if len(full) != width:
         full = [f"feat__{i}" for i in range(width)]
         clean = full[:]
-
     return full, clean
 
+# —— 分位分箱“分层切分”：保持 train/test 的 J0.2 分布接近 ——
+def stratified_split(X, y, test_size=0.2, random_state=42, q=8):
+    try:
+        # 最多 q 个箱，但不超过唯一值数；重复边界去重
+        bins = pd.qcut(y, q=min(q, y.nunique()), duplicates="drop")
+        return train_test_split(X, y, test_size=test_size, random_state=random_state, stratify=bins)
+    except Exception:
+        return train_test_split(X, y, test_size=test_size, random_state=random_state)
+
 @st.cache_resource(show_spinner=True)
-def train_model(X, y, num_cols, cat_cols, test_size, n_estimators, random_state):
-    preprocess = ColumnTransformer(
-        transformers=[
-            ("num", "passthrough", num_cols),
-            ("cat", make_ohe(), cat_cols),
-        ]
-    )
+def train_model(X, y, num_cols, cat_cols, test_size, n_estimators, random_state,
+                min_samples_leaf, max_depth, max_features):
+    preprocess = ColumnTransformer([
+        ("num", "passthrough", num_cols),
+        ("cat", make_ohe(), cat_cols),
+    ])
     rf = RandomForestRegressor(
         n_estimators=n_estimators,
         random_state=random_state,
         n_jobs=-1,
         oob_score=True,
         bootstrap=True,
+        min_samples_leaf=min_samples_leaf,
+        max_depth=max_depth,
+        max_features=max_features
     )
     pipe = Pipeline([("prep", preprocess), ("model", rf)])
-    X_train, X_test, y_train, y_test = train_test_split(
+
+    # 分层切分
+    X_train, X_test, y_train, y_test = stratified_split(
         X, y, test_size=test_size, random_state=random_state
     )
     pipe.fit(X_train, y_train)
@@ -176,7 +179,6 @@ except Exception as e:
     st.error(f"Failed to load data: {e}")
     st.stop()
 
-# Preview EXACTLY your requested columns and order
 st.subheader("Preview data (as provided)")
 available_cols = [c for c in PREVIEW_ORDER if c in df_raw.columns]
 if not available_cols:
@@ -185,10 +187,8 @@ if not available_cols:
 else:
     st.dataframe(df_raw.loc[:, available_cols].head(20), use_container_width=True)
 
-# Canonical training names
 df = apply_training_renames(df_raw)
 
-# Check presence
 missing_feats = [c for c in CANON_FEATURES if c not in df.columns]
 missing_tgt = TARGET_COL not in df.columns
 if missing_feats:
@@ -197,7 +197,6 @@ if missing_tgt:
     st.error(f"Missing required target column: {TARGET_COL}")
     st.stop()
 
-# Build data (drop NA rows in features/target)
 feature_cols = CANON_FEATURES[:]   # locked 5 inputs
 cat_cols = [c for c in CATEGORICAL_FEATS if c in feature_cols]
 num_cols = [c for c in feature_cols if c not in cat_cols]
@@ -211,17 +210,42 @@ if rows_after < 10:
 X = data[feature_cols]
 y = data[TARGET_COL]
 
+# 可选：目标截尾（winsorize 1–99 分位）
+if cap_outliers and len(y) > 10:
+    lo, hi = np.percentile(y, [1, 99])
+    y = y.clip(lo, hi)
+
 # ---------------- Train ----------------
 train_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 pipe, (X_train, X_test, y_train, y_test) = train_model(
-    X, y, num_cols, cat_cols, test_size, n_estimators, random_state
+    X, y, num_cols, cat_cols, test_size, n_estimators, random_state,
+    min_samples_leaf, max_depth, max_features
 )
 st.success("Model trained.")
+
+# ---------------- Target distribution check ----------------
+st.subheader("Target distribution check (train vs test)")
+def _summ(s):
+    s = np.asarray(s, dtype=float).ravel()
+    return pd.Series({
+        "min": float(np.min(s)),
+        "q25": float(np.quantile(s, 0.25)),
+        "median": float(np.median(s)),
+        "q75": float(np.quantile(s, 0.75)),
+        "max": float(np.max(s)),
+        "n": int(len(s))
+    })
+dist_df = pd.concat({
+    "Train": _summ(y_train),
+    "Test":  _summ(y_test),
+    "All":   _summ(y)
+}, axis=1)
+st.table(dist_df)
 
 # ---------------- Evaluation ----------------
 y_pred = pipe.predict(X_test)
 r2 = r2_score(y_test, y_pred)
-rmse = _rmse(y_test, y_pred)   # ✅ 使用兼容函数
+rmse = _rmse(y_test, y_pred)
 
 col1, col2, col3 = st.columns(3)
 with col1:
@@ -232,22 +256,24 @@ with col3:
     oob = getattr(pipe.named_steps["model"], "oob_score_", None)
     st.metric("OOB R²", f"{oob:.3f}" if oob is not None else "N/A")
 
+# Optional CV
+if run_cv:
+    with st.spinner("Running 5-fold CV..."):
+        kf = KFold(n_splits=5, shuffle=True, random_state=random_state)
+        scores = cross_validate(pipe, X, y, cv=kf, scoring="r2", n_jobs=-1)
+    st.write(f"CV R² (mean ± std): **{scores['test_score'].mean():.3f} ± {scores['test_score'].std():.3f}**")
+
 # ---------------- Permutation Importance (aggregated) ----------------
 with st.spinner("Computing permutation importance..."):
     res = permutation_importance(
         pipe, X_test, y_test, n_repeats=10, random_state=random_state, n_jobs=-1
     )
-
-full_names, clean_names = get_all_feature_names(
-    pipe.named_steps["prep"], X_test, num_cols, cat_cols
-)
-
+full_names, clean_names = get_all_feature_names(pipe.named_steps["prep"], X_test, num_cols, cat_cols)
 def base_feature(clean):
     for c in cat_cols:
         if clean.startswith(c + "_"):
             return c
     return clean
-
 pi_df = pd.DataFrame({
     "full_name": full_names[:len(res.importances_mean)],
     "clean_name": clean_names[:len(res.importances_mean)],
@@ -258,10 +284,8 @@ pi_df["base_feature"] = pi_df["clean_name"].apply(base_feature)
 agg = (pi_df.groupby("base_feature", as_index=False)["importance_mean"]
           .sum()
           .sort_values("importance_mean", ascending=False))
-
 st.subheader("Permutation Importance (aggregated to original features)")
 st.dataframe(agg, use_container_width=True)
-
 fig, ax = plt.subplots(figsize=(8, max(3, len(agg)*0.4)))
 ax.barh(agg["base_feature"], agg["importance_mean"])
 ax.invert_yaxis()
@@ -270,33 +294,28 @@ ax.set_xlabel("Mean importance (validation)")
 ax.set_ylabel("Feature")
 st.pyplot(fig, clear_figure=True)
 
-# ---------------- Diagnostics: Actual vs Predicted ----------------
+# ---------------- Diagnostics: Actual vs Predicted (fixed axes) ----------------
 with st.expander("Diagnostics: Actual vs Predicted (J0.2)", expanded=False):
-    # ------- use data-driven limits -------
     a = np.asarray(y_test, dtype=float).ravel()
     p = np.asarray(y_pred, dtype=float).ravel()
     lo = float(np.nanmin(np.concatenate([a, p])))
     hi = float(np.nanmax(np.concatenate([a, p])))
-
-    # small padding to avoid points on frame
     pad = max(1e-6, 0.05 * (hi - lo))
     x0, x1 = lo - pad, hi + pad
 
     fig2, ax2 = plt.subplots()
     ax2.scatter(a, p, label="Data points")
-    # identity line using the same limits
     ax2.plot([x0, x1], [x0, x1], label="Ideal (y = x)")
-    # lock both axes to identical range
     ax2.set_xlim(x0, x1)
     ax2.set_ylim(x0, x1)
-    ax2.set_aspect("equal", adjustable="box")  # optional: 1:1 aspect
-
+    ax2.set_aspect("equal", adjustable="box")
     ax2.set_xlabel("Actual J0.2")
     ax2.set_ylabel("Predicted J0.2")
     ax2.set_title("Actual vs Predicted — J0.2")
     ax2.legend(title="Legend", loc="best")
     st.pyplot(fig2, clear_figure=True)
 
+st.markdown("---")
 
 # ---------------- Model Card ----------------
 with st.expander("Model Card", expanded=True):
@@ -312,15 +331,17 @@ with st.expander("Model Card", expanded=True):
         "n_estimators": n_estimators,
         "random_state": random_state,
         "Bootstrap": True,
+        "min_samples_leaf": min_samples_leaf,
+        "max_depth": max_depth if max_depth is not None else "(None)",
+        "max_features": max_features if max_features is not None else "(None)",
         "OOB R²": f"{getattr(pipe.named_steps['model'], 'oob_score_', float('nan')):.3f}",
         "R² (test)": f"{r2:.3f}",
         "RMSE (test)": f"{rmse:.3f}",
         "CV run?": "Yes" if run_cv else "No",
+        "Outlier capping": "Yes (1–99 pct)" if cap_outliers else "No",
     }
     df_info = pd.DataFrame(list(info.items()), columns=["Field", "Value"])
     st.table(df_info)
-
-    # Quick export
     mc_csv = df_info.to_csv(index=False).encode("utf-8")
     st.download_button("Download Model Card (CSV)", data=mc_csv, file_name="model_card.csv", mime="text/csv")
 
@@ -338,24 +359,18 @@ if do_save:
 
 # ---------------- Inference (single row) ----------------
 st.subheader("Try a single prediction")
-
 if "single_pred_df" not in st.session_state:
     st.session_state.single_pred_df = None
-
 with st.form("single_pred"):
     inputs = {}
     for col in feature_cols:
         if col in cat_cols:
-            cats = sorted(pd.Series(X[col]).dropna().unique().tolist())
-            if len(cats) == 0:
-                st.warning(f"No categories found in training data for '{col}'. Using empty string.")
-                cats = [""]
+            cats = sorted(pd.Series(X[col]).dropna().unique().tolist()) or [""]
             inputs[col] = st.selectbox(col, options=cats, index=0)
         else:
             series = pd.Series(X[col]).dropna()
             default_val = float(pd.to_numeric(series, errors="coerce").median()) if len(series) else 0.0
             inputs[col] = st.number_input(col, value=default_val, step=0.001, format="%.6f")
-
     submitted = st.form_submit_button("Predict J0.2")
     if submitted:
         try:
@@ -366,19 +381,11 @@ with st.form("single_pred"):
         except Exception as e:
             st.session_state.single_pred_df = None
             st.error(f"Prediction failed: {e}")
-
-# render results & download OUTSIDE the form
 if st.session_state.single_pred_df is not None:
     st.write("Prediction:")
     st.dataframe(st.session_state.single_pred_df, use_container_width=True)
     csv = st.session_state.single_pred_df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "Download prediction (CSV)",
-        data=csv,
-        file_name="single_prediction_j02.csv",
-        mime="text/csv",
-        key="single_pred_download"
-    )
+    st.download_button("Download prediction (CSV)", data=csv, file_name="single_prediction_j02.csv", mime="text/csv", key="single_pred_download")
 
 # ---------------- Batch Inference ----------------
 st.subheader("Batch prediction (upload new rows)")
@@ -393,35 +400,29 @@ if batch_file is not None:
             newX = pd.read_csv(batch_file)
         else:
             newX = pd.read_excel(batch_file)
-
-        # Accept either raw or canonical names
         newX = newX.rename(columns={
             "Sour region": "Sour Region",
             "ppH2S(bara)": "ppH2S",
             "a/w": "a/W",
             "Test Pressure(bara)": "Test Pressure",
         })
-
         st.write("Preview of uploaded features:")
         st.dataframe(newX.head(), use_container_width=True)
 
-        # Precompute training fill values (medians for num, modes for cat)
+        # Precompute training fill values
         num_fills = {c: float(pd.to_numeric(X[c], errors="coerce").median()) if X[c].dropna().size else 0.0
                      for c in num_cols}
         cat_fills = {c: (pd.Series(X[c]).mode().iat[0] if not pd.Series(X[c]).mode().empty else "")
                      for c in cat_cols}
 
-        # Ensure required columns exist & coerce types
         for c in feature_cols:
             if c not in newX.columns:
                 newX[c] = cat_fills[c] if c in cat_cols else num_fills.get(c, 0.0)
 
-        # Numeric -> numeric + fill
         for c in num_cols:
             newX[c] = pd.to_numeric(newX[c], errors="coerce")
             newX[c].fillna(num_fills[c], inplace=True)
 
-        # Categorical -> fill first, then cast to string (avoids literal "nan")
         for c in cat_cols:
             col = newX[c]
             if col.dtype.name != "string":
@@ -432,7 +433,6 @@ if batch_file is not None:
         preds = pipe.predict(newX[feature_cols])
         preds_df = pd.DataFrame({"J0.2_pred": preds})
         out = pd.concat([newX.reset_index(drop=True), preds_df], axis=1)
-
         st.write("Predictions:")
         st.dataframe(out.head(50), use_container_width=True)
 
