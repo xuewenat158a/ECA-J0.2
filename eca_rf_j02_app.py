@@ -272,18 +272,31 @@ st.pyplot(fig, clear_figure=True)
 
 # ---------------- Diagnostics: Actual vs Predicted ----------------
 with st.expander("Diagnostics: Actual vs Predicted (J0.2)", expanded=False):
+    # ------- use data-driven limits -------
+    a = np.asarray(y_test, dtype=float).ravel()
+    p = np.asarray(y_pred, dtype=float).ravel()
+    lo = float(np.nanmin(np.concatenate([a, p])))
+    hi = float(np.nanmax(np.concatenate([a, p])))
+
+    # small padding to avoid points on frame
+    pad = max(1e-6, 0.05 * (hi - lo))
+    x0, x1 = lo - pad, hi + pad
+
     fig2, ax2 = plt.subplots()
-    ax2.scatter(y_test, y_pred, label="Data points")
+    ax2.scatter(a, p, label="Data points")
+    # identity line using the same limits
+    ax2.plot([x0, x1], [x0, x1], label="Ideal (y = x)")
+    # lock both axes to identical range
+    ax2.set_xlim(x0, x1)
+    ax2.set_ylim(x0, x1)
+    ax2.set_aspect("equal", adjustable="box")  # optional: 1:1 aspect
+
     ax2.set_xlabel("Actual J0.2")
     ax2.set_ylabel("Predicted J0.2")
     ax2.set_title("Actual vs Predicted — J0.2")
-    mn = min(ax2.get_xlim()[0], ax2.get_ylim()[0])
-    mx = max(ax2.get_xlim()[1], ax2.get_ylim()[1])
-    ax2.plot([mn, mx], [mn, mx], label="Ideal (y = x)")
     ax2.legend(title="Legend", loc="best")
     st.pyplot(fig2, clear_figure=True)
 
-st.markdown("---")
 
 # ---------------- Model Card ----------------
 with st.expander("Model Card", expanded=True):
